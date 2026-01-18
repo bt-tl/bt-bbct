@@ -42,8 +42,8 @@ BROADCAST_BATCH = int((os.getenv("BROADCAST_BATCH") or "2000").strip()) # fetch 
 # id bisa int (-100xxx) atau username "@channel"
 # =========================
 REQUIRED_CHANNELS = [
-    {"id": "-1001583979408", "name": "Bicolink Official Channel", "url": "https://t.me/bicolinks"},
-    {"id": "-1001688830091", "name": "Bicolink Official Group", "url": "https://t.me/bicolink"},
+    {"id": "-1002393427171", "name": "BOBACIN", "url": "https://t.me/bobacin_core"},
+    {"id": "-1002559562310", "name": "CIKIBOY", "url": "https://t.me/cikiboy_web"},
     # maksimal 5 item
 ]
 
