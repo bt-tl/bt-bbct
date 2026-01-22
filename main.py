@@ -2,7 +2,6 @@ import os
 import asyncio
 import secrets
 import time
-from typing import Optional, Tuple, AsyncGenerator, Callable, Any
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery
@@ -14,11 +13,9 @@ from aiogram.exceptions import (
     TelegramForbiddenError,
     TelegramBadRequest,
     TelegramNotFound,
-    TelegramConflictError,
 )
 
 import psycopg
-import psycopg_pool
 from psycopg_pool import AsyncConnectionPool
 
 
@@ -37,12 +34,8 @@ for part in _raw_owner.split(","):
     if part:
         OWNER_IDS.add(int(part))
 
-BROADCAST_RATE = float((os.getenv("BROADCAST_RATE") or "20").strip())    # msg/sec (aman)
-BROADCAST_BATCH = int((os.getenv("BROADCAST_BATCH") or "2000").strip())  # fetch per batch
-
-# Pool tuning (buat stabil di Railway)
-DB_POOL_MAX = int((os.getenv("DB_POOL_MAX") or "5").strip())
-DB_POOL_TIMEOUT = int((os.getenv("DB_POOL_TIMEOUT") or "60").strip())
+BROADCAST_RATE = float((os.getenv("BROADCAST_RATE") or "20").strip())   # msg/sec
+BROADCAST_BATCH = int((os.getenv("BROADCAST_BATCH") or "2000").strip()) # fetch per batch
 
 # =========================
 # REQUIRED JOIN CHANNELS (MAX 5)
@@ -51,6 +44,7 @@ DB_POOL_TIMEOUT = int((os.getenv("DB_POOL_TIMEOUT") or "60").strip())
 REQUIRED_CHANNELS = [
     {"id": "-1002393427171", "name": "BOBACIN", "url": "https://t.me/bobacin_core"},
     {"id": "-1002559562310", "name": "CIKIBOY", "url": "https://t.me/cikiboy_web"},
+    # maksimal 5 item
 ]
 
 # =========================
@@ -74,37 +68,8 @@ if len(REQUIRED_CHANNELS) > 5:
 def is_owner(user_id: int) -> bool:
     return user_id in OWNER_IDS
 
-
 def make_slug() -> str:
     return secrets.token_urlsafe(8).replace("-", "").replace("_", "")[:12]
-
-
-def extract_title(m: Message) -> str:
-    """Ambil judul/nama file yang paling masuk akal dari pesan Telegram."""
-    if m.document:
-        return m.document.file_name or "document"
-    if m.video:
-        return m.video.file_name or "video"
-    if m.audio:
-        if m.audio.file_name:
-            return m.audio.file_name
-        if m.audio.performer and m.audio.title:
-            return f"{m.audio.performer} - {m.audio.title}"
-        if m.audio.title:
-            return m.audio.title
-        return "audio"
-    if m.voice:
-        return "voice"
-    if m.video_note:
-        return "video_note"
-    if m.photo:
-        return "photo"
-    if m.animation:
-        return m.animation.file_name or "animation"
-    if m.sticker:
-        return f"sticker ({m.sticker.emoji or '🙂'})"
-    return "file"
-
 
 def gate_text() -> str:
     if not REQUIRED_CHANNELS:
@@ -116,8 +81,7 @@ def gate_text() -> str:
         "Setelah join, klik tombol **✅ Saya sudah join**."
     )
 
-
-def join_keyboard(slug: Optional[str]):
+def join_keyboard(slug: str | None):
     kb = InlineKeyboardBuilder()
     for ch in REQUIRED_CHANNELS:
         kb.button(text=f"Join {ch['name']}", url=ch["url"])
@@ -125,7 +89,6 @@ def join_keyboard(slug: Optional[str]):
     kb.button(text="✅ Saya sudah join", callback_data=cb)
     kb.adjust(1)
     return kb.as_markup()
-
 
 async def is_joined_all(bot: Bot, user_id: int) -> bool:
     if not REQUIRED_CHANNELS:
@@ -139,11 +102,10 @@ async def is_joined_all(bot: Bot, user_id: int) -> bool:
             if status in ("left", "kicked") or status is None:
                 return False
         except Exception:
-            # biasanya: bot tidak ada di channel private / tidak bisa cek member
+            # bot gak bisa cek membership (umumnya bot tidak ada di channel private tsb)
             return False
 
     return True
-
 
 class RateLimiter:
     """Global rate limiter: target N msg/sec."""
@@ -167,14 +129,11 @@ class RateLimiter:
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS files (
   slug TEXT PRIMARY KEY,
-  title TEXT,
   channel_id BIGINT NOT NULL,
   channel_message_id BIGINT NOT NULL,
   uploaded_by BIGINT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-
-CREATE INDEX IF NOT EXISTS idx_files_created_at ON files(created_at);
 
 CREATE TABLE IF NOT EXISTS users (
   user_id BIGINT PRIMARY KEY,
@@ -193,34 +152,15 @@ CREATE INDEX IF NOT EXISTS idx_users_user_id ON users(user_id);
 # MAIN
 # =========================
 async def main():
-    # ✅ Pool dibuat di dalam event loop (open=False agar tidak error "no running loop")
+    # ✅ IMPORTANT: create pool inside loop / open later
     pool = AsyncConnectionPool(
         conninfo=DATABASE_URL,
         min_size=1,
-        max_size=DB_POOL_MAX,
-        timeout=DB_POOL_TIMEOUT,
-        open=False,
+        max_size=10,
+        timeout=30,
+        open=False,  # <= FIX utama
     )
     await pool.open()
-
-    async def db_retry(fn: Callable[..., Any], *args, **kwargs):
-        """
-        Retry DB ops untuk kasus umum Railway:
-        - SSL SYSCALL EOF
-        - connection timeout
-        - pool timeout
-        """
-        last_exc = None
-        for attempt in range(5):
-            try:
-                return await fn(*args, **kwargs)
-            except (psycopg.OperationalError, psycopg_pool.PoolTimeout) as e:
-                last_exc = e
-                await asyncio.sleep(1.5 * (attempt + 1))
-        # terakhir: lempar lagi biar terlihat kalau DB benar-benar down
-        if last_exc:
-            raise last_exc
-        return await fn(*args, **kwargs)
 
     async def db_init():
         async with pool.connection() as conn:
@@ -228,7 +168,7 @@ async def main():
                 await cur.execute(SCHEMA_SQL)
             await conn.commit()
 
-    async def db_upsert_user(user_id: int, username: Optional[str], first_name: Optional[str], last_name: Optional[str]):
+    async def db_upsert_user(user_id: int, username: str | None, first_name: str | None, last_name: str | None):
         sql = """
         INSERT INTO users (user_id, username, first_name, last_name, last_start)
         VALUES (%s, %s, %s, %s, NOW())
@@ -256,28 +196,27 @@ async def main():
                 await cur.execute("DELETE FROM users WHERE user_id = %s;", (user_id,))
             await conn.commit()
 
-    async def db_put_file(slug: str, title: str, channel_id: int, channel_message_id: int, uploaded_by: int):
+    async def db_put_file(slug: str, channel_id: int, channel_message_id: int, uploaded_by: int):
         sql = """
-        INSERT INTO files (slug, title, channel_id, channel_message_id, uploaded_by)
-        VALUES (%s, %s, %s, %s, %s);
+        INSERT INTO files (slug, channel_id, channel_message_id, uploaded_by)
+        VALUES (%s, %s, %s, %s);
         """
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
-                await cur.execute(sql, (slug, title, channel_id, channel_message_id, uploaded_by))
+                await cur.execute(sql, (slug, channel_id, channel_message_id, uploaded_by))
             await conn.commit()
 
-    async def db_get_file(slug: str) -> Optional[Tuple[str, int, int]]:
-        sql = "SELECT title, channel_id, channel_message_id FROM files WHERE slug = %s;"
+    async def db_get_file(slug: str):
+        sql = "SELECT channel_id, channel_message_id FROM files WHERE slug = %s;"
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(sql, (slug,))
                 row = await cur.fetchone()
                 if not row:
                     return None
-                title, ch_id, ch_msg_id = row
-                return str(title or ""), int(ch_id), int(ch_msg_id)
+                return int(row[0]), int(row[1])
 
-    async def db_iter_user_ids(batch_size: int = 2000) -> AsyncGenerator[int, None]:
+    async def db_iter_user_ids(batch_size: int = 2000):
         # tanpa OFFSET (lebih aman untuk 100k+)
         last_id = 0
         while True:
@@ -301,14 +240,14 @@ async def main():
                 yield uid
                 last_id = uid
 
-    await db_retry(db_init)
+    await db_init()
 
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
     limiter = RateLimiter(BROADCAST_RATE)
 
-    async def send_file_to_user(user_chat_id: int, slug: str, origin_msg: Optional[Message] = None):
-        found = await db_retry(db_get_file, slug)
+    async def send_file_to_user(user_chat_id: int, slug: str, origin_msg: Message | None = None):
+        found = await db_get_file(slug)
         if not found:
             text = "❌ File tidak ditemukan / link sudah tidak valid."
             if origin_msg:
@@ -317,16 +256,13 @@ async def main():
                 await bot.send_message(user_chat_id, text)
             return
 
-        _title, ch_id, ch_msg_id = found
+        ch_id, ch_msg_id = found
         try:
             await bot.copy_message(
                 chat_id=user_chat_id,
                 from_chat_id=ch_id,
                 message_id=ch_msg_id,
             )
-        except TelegramRetryAfter as e:
-            await asyncio.sleep(float(e.retry_after) + 0.5)
-            await bot.copy_message(chat_id=user_chat_id, from_chat_id=ch_id, message_id=ch_msg_id)
         except Exception as e:
             text = f"❌ Gagal mengirim file. ({type(e).__name__})"
             if origin_msg:
@@ -338,12 +274,11 @@ async def main():
     @dp.message(CommandStart())
     async def start_handler(message: Message):
         if message.from_user:
-            await db_retry(
-                db_upsert_user,
-                message.from_user.id,
-                message.from_user.username,
-                message.from_user.first_name,
-                message.from_user.last_name,
+            await db_upsert_user(
+                user_id=message.from_user.id,
+                username=message.from_user.username,
+                first_name=message.from_user.first_name,
+                last_name=message.from_user.last_name,
             )
 
         parts = (message.text or "").split(maxsplit=1)
@@ -414,7 +349,7 @@ async def main():
         uid = message.from_user.id if message.from_user else 0
         if not is_owner(uid):
             return
-        total = await db_retry(db_count_users)
+        total = await db_count_users()
         await message.answer(f"👤 Total user tersimpan: {total}")
 
     # -------- /broadcast (owner, reply) --------
@@ -428,7 +363,7 @@ async def main():
             await message.answer("Cara pakai:\nReply pesan/file yang mau dikirim, lalu ketik /broadcast")
             return
 
-        total = await db_retry(db_count_users)
+        total = await db_count_users()
         if total <= 0:
             await message.answer("Database user masih kosong.")
             return
@@ -462,16 +397,20 @@ async def main():
             except TelegramRetryAfter as e:
                 await asyncio.sleep(float(e.retry_after) + 0.5)
                 try:
-                    await bot.copy_message(chat_id=target_id, from_chat_id=src_chat_id, message_id=src_msg_id)
+                    await bot.copy_message(
+                        chat_id=target_id,
+                        from_chat_id=src_chat_id,
+                        message_id=src_msg_id,
+                    )
                     sent += 1
                 except (TelegramForbiddenError, TelegramNotFound, TelegramBadRequest):
-                    await db_retry(db_delete_user, target_id)
+                    await db_delete_user(target_id)
                     deleted += 1
                 except Exception:
                     failed += 1
 
             except (TelegramForbiddenError, TelegramNotFound, TelegramBadRequest):
-                await db_retry(db_delete_user, target_id)
+                await db_delete_user(target_id)
                 deleted += 1
 
             except Exception:
@@ -504,6 +443,34 @@ async def main():
             await message.answer("⛔ Kamu tidak punya akses upload.")
             return
 
+        # Ambil "nama file/judul" yang paling masuk akal dari pesan
+        def extract_title(m: Message) -> str:
+            if m.document:
+                return m.document.file_name or "document"
+            if m.video:
+                return m.video.file_name or "video"
+            if m.audio:
+                # audio kadang gak punya file_name tapi punya title/performer
+                if m.audio.file_name:
+                    return m.audio.file_name
+                if m.audio.performer and m.audio.title:
+                    return f"{m.audio.performer} - {m.audio.title}"
+                if m.audio.title:
+                    return m.audio.title
+                return "audio"
+            if m.voice:
+                return "voice"
+            if m.video_note:
+                return "video_note"
+            if m.photo:
+                return "photo"
+            if m.animation:
+                return m.animation.file_name or "animation"
+            if m.sticker:
+                # sticker biasanya ga ada file name
+                return f"sticker ({m.sticker.emoji or '🙂'})"
+            return "file"
+
         file_title = extract_title(message)
 
         try:
@@ -517,9 +484,9 @@ async def main():
             return
 
         slug = make_slug()
-        for _ in range(5):
+        for _ in range(3):
             try:
-                await db_retry(db_put_file, slug, file_title, int(CHANNEL_ID), int(copied.message_id), int(uid))
+                await db_put_file(slug, int(CHANNEL_ID), int(copied.message_id), int(uid))
                 break
             except psycopg.errors.UniqueViolation:
                 slug = make_slug()
@@ -527,13 +494,22 @@ async def main():
             await message.answer("❌ Gagal membuat slug unik. Coba lagi.")
             return
 
-        link = f"https://t.me/{BOT_USERNAME}?start={slug}" if BOT_USERNAME else f"Slug: {slug}"
-        await message.answer(
-            "✅ Tersimpan!\n"
-            f"Nama file: {file_title}\n"
-            "🔗 Link publik:\n"
-            f"{link}"
-        )
+        if BOT_USERNAME:
+            link = f"https://t.me/{BOT_USERNAME}?start={slug}"
+            # link = f"https://hepifile.com?start={slug}"
+            await message.answer(
+                "✅ Tersimpan!\n"
+                f"Nama file: {file_title}\n"
+                "🔗 Link publik:\n"
+                f"{link}"
+            )
+        else:
+            await message.answer(
+                "✅ Tersimpan!\n"
+                f"Nama file: {file_title}\n"
+                f"Slug: {slug}\n"
+                "(Set BOT_USERNAME untuk link otomatis)"
+            )
 
     @dp.message()
     async def fallback(message: Message):
@@ -543,22 +519,8 @@ async def main():
         else:
             await message.answer("Buka link file yang kamu punya ya (t.me/<bot>?start=...).")
 
-    # Anti conflict + buang pending updates (lebih stabil di redeploy)
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
-    except Exception:
-        pass
-
-    try:
-        await dp.start_polling(
-            bot,
-            polling_timeout=30,
-            allowed_updates=dp.resolve_used_update_types(),
-        )
-    except TelegramConflictError:
-        # Artinya ada instance lain lagi polling bot ini.
-        # Solusi: pastikan hanya 1 instance/replica berjalan.
-        raise
+        await dp.start_polling(bot)
     finally:
         await pool.close()
 
